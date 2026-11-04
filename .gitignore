@@ -1,0 +1,30 @@
+# ROS 2 buildbestanden
+/build/
+/install/
+/log/
+/raw_demonstrations/
+
+# VS Code cache en databases
+.vscode/
+*.db
+*.db-shm
+*.db-wal
+*.db.lock
+
+# Python-cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtuele omgevingen
+.venv/
+venv/
+
+# Geheimen en lokale instellingen
+.env
+
+# Modelbestanden
+*.pt
+*.pth
+*.onnx
+evaluation_results/
