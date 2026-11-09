@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# Two-pass conversion of recorded CSV/JPEG demonstrations to LeRobot.
+# Pass 1: estimate typical end-force and end-depth from the demonstrations.
+# Pass 2: trim episodes, create observation/action pairs, append synthetic
+# stop/retraction examples, and write a local LeRobotDataset.
+# NOTE: End-force/depth heuristics are needle-specific but currently applied
+# to every --use-case, including trajectory and pick_place. Validate first.
 import os
 import glob
 import argparse
@@ -11,6 +17,8 @@ from PIL import Image
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
+# Estimate tool-tip Z using the UR3e DH model and assumed tool offset.
+# This is used by the end-of-task heuristic, not the policy controller.
 def ur3e_forward_kinematics_z(q: np.ndarray, tcp_offset_z: float = 0.18) -> float:
     """Berekent de Z-hoogte (in meters) van de naaldpunt (TCP) uit de 6 gewrichtshoeken."""
     d = [0.15185, 0.0, 0.0, 0.13105, 0.08535, 0.0921 + tcp_offset_z]
@@ -32,6 +40,7 @@ def ur3e_forward_kinematics_z(q: np.ndarray, tcp_offset_z: float = 0.18) -> floa
     return float(T[2, 3])
 
 
+# Accept legacy recordings with either q0..q5, q1..q6 or named joints.
 def detect_joint_cols(df: pd.DataFrame):
     possible_joint_cols = [
         ['q0', 'q1', 'q2', 'q3', 'q4', 'q5'],
@@ -46,6 +55,7 @@ def detect_joint_cols(df: pd.DataFrame):
 
 def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
                   trim_idle: bool = True, hold_frames: int = 150, tcp_offset_z: float = 0.18):
+    # Each episode folder must contain data.csv and corresponding image files.
     episode_dirs = sorted(glob.glob(os.path.join(raw_dir, "episode_*")))
     if not episode_dirs:
         raise ValueError(f"Geen episodes gevonden in {raw_dir}")
@@ -69,10 +79,12 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
 
         joint_cols = detect_joint_cols(df)
         q_all = df[joint_cols].to_numpy(dtype=np.float32)
+        # Smooth logged (already tared) force data before estimating a goal.
         f_df = df[force_cols].rolling(window=5, min_periods=1).mean()
         f_all = f_df.to_numpy(dtype=np.float32)
 
         # Kijk naar het laatste kwart van de demonstratie (waar de injectie op diepte is)
+        # Use the last 30% of each episode to estimate terminal contact.
         tail_start = int(len(q_all) * 0.70)
         tail_fz = np.abs(f_all[tail_start:, 2])
         peak_tail_fz = float(np.percentile(tail_fz, 90))  # Robuust tegen 1-frame uitschieters
@@ -84,6 +96,8 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
         ep_min_z_m.append(min_z)
         valid_episodes.append((ep_dir, df, joint_cols, q_all, f_all))
 
+    # One global target is shared across all retained episodes.
+    # This does NOT apply any >30%-from-mean demonstration filter.
     mean_target_fz = float(np.mean(ep_end_forces))
     std_target_fz = float(np.std(ep_end_forces))
     mean_target_z_m = float(np.mean(ep_min_z_m))
@@ -98,6 +112,8 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
     # =========================================================================
     # PASS 2: Bouw dataset en markeer alles vanaf het doelwit als KLAAR (dq = 0)
     # =========================================================================
+    # Observations: 6 joint positions, optionally 3 force components.
+    # Actions: 6 joint POSITION INCREMENTS, not absolute positions/speeds.
     state_dim = 9 if use_forces else 6
     features = {
         "observation.images.top_view": {
@@ -117,6 +133,8 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
         },
     }
 
+    # WARNING: conversion replaces any existing local dataset with this ID.
+    # Do not reuse the same repo_id if you want to preserve old output.
     cache_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
     if cache_dir.exists():
         print(f"Oude dataset gevonden. Wordt opgeruimd: {cache_dir}")
@@ -131,8 +149,10 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
 
     for ep_dir, df, joint_cols, q_all, f_all in valid_episodes:
         img_paths = df['image_path'].tolist()
+        # Teacher actions: delta-q(t) = q(t+1) - q(t), in radians/frame.
         dq_all = q_all[1:] - q_all[:-1]
 
+        # Remove idle frames before the first meaningful joint movement.
         start_idx = 0
         if trim_idle:
             moving_indices = np.where(np.linalg.norm(dq_all, axis=1) > 0.0008)[0]
@@ -140,6 +160,8 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
                 start_idx = max(0, int(moving_indices[0]) - 2)
 
         # Zoek in de tweede helft van de episode het moment waarop het doel (kracht of diepte) is bereikt
+        # Search for a terminal force/depth event only in the latter half;
+        # early transient contact should not truncate the episode.
         half_idx = max(start_idx + 10, int(len(df) * 0.55))
         goal_idx = len(df) - 1
 
@@ -155,6 +177,7 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
 
         frames_added = 0
         last_img_rgb = None
+        # Hold the final joint pose and camera image for synthetic examples.
         goal_q = q_all[goal_idx].copy()
         goal_f = f_all[goal_idx].copy()
 
@@ -164,6 +187,8 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
             goal_f[2] = sign_fz * mean_target_fz
 
         # Bewaar de laatste neerwaartse bewegingsrichting om bij te hoge kracht subtiel terug te kunnen veren
+        # A recent average action defines the direction to oppose when
+        # producing synthetic retraction targets after excessive force.
         recent_dq = np.mean(dq_all[max(start_idx, goal_idx - 10):max(start_idx + 1, goal_idx)], axis=0)
 
         # Voeg de actieve bewegingsframes toe tot aan het doelwit (goal_idx)
@@ -172,9 +197,13 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
             dq_t = dq_all[t]
             f_t = f_all[t]
 
+            # All policies see vision and joint state; force-input policies
+            # additionally observe wrist F/T components Fx, Fy, Fz.
             state_t = np.concatenate([q_t, f_t], axis=0) if use_forces else q_t
 
             img_full_path = os.path.join(ep_dir, img_paths[t])
+            # Normalize image representation to RGB 320x240. Random image
+            # cropping is enabled later in training, not during conversion.
             img_pil = Image.open(img_full_path).convert("RGB").resize((320, 240), Image.BILINEAR)
             img_rgb = np.array(img_pil)
 
@@ -195,6 +224,9 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
         # - Bij 95% tot 115% van de doelkracht -> dq = [0, 0, 0, 0, 0, 0] (volledig stilhouden)
         # - Bij 115% tot 200% van de doelkracht (alleen voor use_forces) -> lichte terugveer-actie (-0.15 * recent_dq)
         #   zodat het model actief druk vermindert als het ooit te ver doorduwt!
+        # Synthetic samples are NOT measured demonstration frames:
+        # force increases with a FIXED image and FIXED joint observation,
+        # but the label can request a small reversal. Interpret with care.
         if frames_added > 0 and hold_frames > 0:
             zero_action = np.zeros(6, dtype=np.float32)
             for h_idx in range(hold_frames):
@@ -204,6 +236,8 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
                     aug_f = goal_f * scale
                     hold_state = np.concatenate([goal_q, aug_f], axis=0).astype(np.float32)
 
+                    # Above 120% of reference force, use a small action in
+                    # the opposite direction of recent joint movement.
                     if scale > 1.20:
                         # Subtiele terugveer-actie als de kracht boven de 120% van het doel komt
                         rebound_factor = min(0.25, (scale - 1.20) * 0.30)
@@ -222,6 +256,7 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
                 })
                 frames_added += 1
 
+        # Store each recorded demonstration as one LeRobot episode.
         if frames_added > 0:
             dataset.save_episode()
             z_goal_mm = ur3e_forward_kinematics_z(goal_q, tcp_offset_z) * 1000.0
@@ -235,6 +270,8 @@ def build_dataset(raw_dir: str, repo_id: str, fps: int, use_forces: bool,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # --use-case changes the input directory and dataset ID; it does NOT
+    # change the end-force/depth rule or the hard-coded task label below.
     parser.add_argument('--use-case', choices=['needle', 'pick_place', 'trajectory'], required=True)
     parser.add_argument('--demo-mode', choices=['haptic', 'no_haptic'], required=True)
     parser.add_argument('--use-forces', action='store_true', help="Voeg krachtmetingen (Fx, Fy, Fz) toe")
@@ -244,6 +281,7 @@ if __name__ == "__main__":
     parser.add_argument('--no-trim', action='store_true')
     args = parser.parse_args()
 
+    # Hard-coded workspace location; must match record_episodes.py.
     raw_dir = os.path.expanduser(f"~/ros2_ws/raw_demonstrations/{args.use_case}/{args.demo_mode}")
     force_tag = "with_force" if args.use_forces else "no_force"
     repo_id = f"local/ur3e_{args.use_case}_{args.demo_mode}_{force_tag}"

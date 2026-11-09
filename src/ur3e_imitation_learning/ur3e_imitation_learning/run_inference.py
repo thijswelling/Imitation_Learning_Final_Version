@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Autonomous execution of a trained LeRobot Diffusion Policy on the UR3e.
+# Policy output: 6 relative joint-position increments (radians/action).
+# Actuation: a separate joint-space P tracker converts target joint error
+# into velocity commands on /forward_velocity_controller/commands.
+# IMPORTANT: never run this node and the teleop controller simultaneously.
 import os
 import sys
 import csv
@@ -43,6 +48,8 @@ UR3E_JOINT_NAMES = [
 ]
 
 
+# Compute an approximate TCP position for logging/evaluation only.
+# Adjust tcp_offset_z if the end-effector/gripper/tool geometry changes.
 def ur3e_forward_kinematics(q: np.ndarray, tcp_offset_z: float = 0.18) -> np.ndarray:
     d = [0.15185, 0.0, 0.0, 0.13105, 0.08535, 0.0921 + tcp_offset_z]
     a = [0.0, -0.24355, -0.2132, 0.0, 0.0, 0.0]
@@ -87,6 +94,8 @@ class PolicyInferenceNode(Node):
         self.dq_deadzone = dq_deadzone
 
         self.bridge = CvBridge()
+        # GPU is preferred for real-time diffusion. The autocast code below
+        # uses float16 and should be verified if attempting CPU-only execution.
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         model_tag = "with_force" if self.use_forces else "no_force"
@@ -114,6 +123,8 @@ class PolicyInferenceNode(Node):
 
         os.environ["HF_HUB_OFFLINE"] = "1"
 
+        # Load trained weights/config from LeRobot checkpoint. The matching
+        # LeRobot code revision is needed for compatible checkpoint loading.
         self.policy = DiffusionPolicy.from_pretrained(Path(real_checkpoint_path))
 
         if num_inference_steps is not None and num_inference_steps > 0:
@@ -136,6 +147,7 @@ class PolicyInferenceNode(Node):
 
         self.policy.to(self.device)
         self.policy.eval()
+        # Clear the policy action queue so this run starts from fresh state.
         self.policy.reset()
 
         self.preprocessor, self.postprocessor = make_pre_post_processors(
@@ -159,6 +171,8 @@ class PolicyInferenceNode(Node):
         self.joint_order_idx = None
         self.latest_img_rgb = None
         self.latest_gripper_state = 0.0
+        # Keep 30 raw wrist force samples for start-of-run taring and
+        # a 5-sample moving mean for the live force observation.
         self.wrench_calib_buffer = deque(maxlen=30)
         self.wrench_filter_buffer = deque(maxlen=5)
         self.force_offset = np.zeros(3, dtype=np.float32)
@@ -169,8 +183,12 @@ class PolicyInferenceNode(Node):
         self.contact_start_time = None
         self.last_dq_norm = 0.0
 
+        # target_q accumulates predicted delta-q commands; each predicted
+        # action can be tracked for up to ticks_per_action control callbacks.
         self.target_q = None
         self.substep_ticks = 0
+        # At a 30 Hz timer, six ticks may occupy up to ~0.2 s per action;
+        # max_steps is a count of policy actions, NOT a fixed wall time.
         self.ticks_per_action = 6
         self.max_delta_q = 0.04
         self.max_vel = 0.45
@@ -230,6 +248,7 @@ class PolicyInferenceNode(Node):
                 pass
         return runs
 
+    # Run the network before the first motion to reduce first-call latency.
     def warmup_gpu(self):
         self.get_logger().info("GPU warm-up uitvoeren (2 passes)...")
         base_state_dim = 6
@@ -270,6 +289,7 @@ class PolicyInferenceNode(Node):
             "--> Robot beweegt nu EERST automatisch naar de Home-positie..."
         )
 
+    # Incoming JointState may list joints in any order; map by name once.
     def joint_cb(self, msg: JointState):
         if self.joint_order_idx is None:
             name_to_idx = {name: i for i, name in enumerate(msg.name)}
@@ -280,6 +300,7 @@ class PolicyInferenceNode(Node):
         pos = msg.position
         self.latest_q = np.array([pos[i] for i in self.joint_order_idx], dtype=np.float32)
 
+    # Cache raw wrist F/T forces; only Fx, Fy, Fz are used here.
     def wrench_cb(self, msg: WrenchStamped):
         f = msg.wrench.force
         w = (f.x, f.y, f.z)
@@ -291,6 +312,7 @@ class PolicyInferenceNode(Node):
             return np.zeros(3, dtype=np.float32)
         return np.mean(self.wrench_filter_buffer, axis=0, dtype=np.float32)
 
+    # Convert BGR ROS images to RGB, resized to model expected shape.
     def image_cb(self, msg: Image):
         bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         if bgr.shape[0] != self.expected_h or bgr.shape[1] != self.expected_w:
@@ -341,6 +363,8 @@ class PolicyInferenceNode(Node):
                 throttle_duration_sec=1.0
             )
 
+    # Average recent force samples at home, with no external contact.
+    # This is baseline subtraction, not full gravity compensation.
     def recalibrate_force_offset(self):
         if len(self.wrench_calib_buffer) > 0:
             self.force_offset = np.mean(self.wrench_calib_buffer, axis=0, dtype=np.float32)
@@ -348,6 +372,7 @@ class PolicyInferenceNode(Node):
             f"⚖️  Krachtsensor gekalibreerd in Home-positie! Offset: {np.round(self.force_offset, 2)} N"
         )
 
+    # Actuate the robot with six joint velocities (rad/s), not positions.
     def publish_vel(self, q_dot_list):
         cmd_msg = Float64MultiArray()
         cmd_msg.data = [float(x) for x in q_dot_list]
@@ -356,6 +381,7 @@ class PolicyInferenceNode(Node):
     def stop_robot(self):
         self.publish_vel([0.0] * 6)
 
+    # Log real execution measurements for per-run CSVs and diagnostics.
     def record_datapoint(self, q_t: np.ndarray, f_cal: np.ndarray, dq_norm: float):
         if self.run_start_wall_time is None:
             self.run_start_wall_time = time.perf_counter()
@@ -388,6 +414,8 @@ class PolicyInferenceNode(Node):
             "q5": float(q_t[5]),
         })
 
+    # Stop motion, save raw CSV + summary metrics + diagnostic plot,
+    # then return to HOMING before another run.
     def finish_run(self, outcome: str = "SUCCESS"):
         self.stop_robot()
         if not self.run_log:
@@ -567,6 +595,7 @@ class PolicyInferenceNode(Node):
         plt.savefig(plot_path)
         plt.close(fig)
 
+    # Clear contact detection, target and action counters for each trial.
     def _reset_run_state(self):
         self.step_count = 0
         self.had_contact = False
@@ -575,12 +604,15 @@ class PolicyInferenceNode(Node):
         self.target_q = None
         self.substep_ticks = 0
 
+    # State machine: HOMING -> PAUSED -> RUNNING -> AWAIT_LABEL -> HOMING.
+    # No task-space/Jacobian controller is used during policy execution.
     def control_loop(self):
         if self.latest_q is None or self.latest_img_rgb is None:
             return
 
         q_t = self.latest_q.copy()
 
+        # Home using joint-space P tracking with a conservative velocity cap.
         if self.mode == 'HOMING':
             q_error = self.absolute_home_q - q_t
             max_err = float(np.max(np.abs(q_error)))
@@ -608,10 +640,12 @@ class PolicyInferenceNode(Node):
             self.stop_robot()
             return
 
+        # Read current robot/sensor state and track or request a policy action.
         if self.mode == 'RUNNING':
             w_t = self.get_filtered_wrench()
             f_cal = w_t - self.force_offset
 
+            # Software cutoff uses |Fz| ONLY, not the full force vector.
             if abs(f_cal[2]) > self.max_fz_limit:
                 self.stop_robot()
                 self.get_logger().warn(
@@ -624,6 +658,8 @@ class PolicyInferenceNode(Node):
                 self.target_q = q_t.copy()
                 self.substep_ticks = 0
 
+            # Continue tracking the prior action target without inference.
+            # This makes policy-action rate lower than the ROS timer rate.
             if self.substep_ticks > 0:
                 q_err = self.target_q - q_t
                 if float(np.max(np.abs(q_err))) > 0.0004:
@@ -635,6 +671,8 @@ class PolicyInferenceNode(Node):
                 else:
                     self.substep_ticks = 0
 
+            # LeRobot internally caches predicted action chunks. A new
+            # denoising pass occurs when that queue is empty.
             if len(self.policy._queues["action"]) == 0:
                 q_err = self.target_q - q_t
                 if float(np.max(np.abs(q_err))) > 0.0004 and self.step_count > 0:
@@ -646,6 +684,7 @@ class PolicyInferenceNode(Node):
 
             img_t = self.latest_img_rgb.copy()
 
+            # Match the dataset feature order: 6 joints then optional Fx/Fy/Fz.
             state_parts = [q_t]
             if self.use_forces:
                 state_parts.append(f_cal)
@@ -669,6 +708,8 @@ class PolicyInferenceNode(Node):
             batch = self.preprocessor(batch)
 
             inference_start = time.perf_counter()
+            # Diffusion generates an action chunk from current observations.
+            # This call can take longer than one 30 Hz control interval.
             with torch.inference_mode(), torch.autocast(device_type=self.device.type, dtype=torch.float16):
                 action_tensor = self.policy.select_action(batch)
             inference_ms = (time.perf_counter() - inference_start) * 1000.0
@@ -677,6 +718,7 @@ class PolicyInferenceNode(Node):
             action_np = action_tensor.squeeze(0).cpu().numpy()
 
             dq = action_np[:6]
+            # Clip each predicted joint increment before integrating it.
             dq_clipped = np.clip(dq, -self.max_delta_q, self.max_delta_q)
             raw_dq_norm = float(np.linalg.norm(dq_clipped))
 
@@ -689,6 +731,7 @@ class PolicyInferenceNode(Node):
 
             # Als het model na contact aangeeft bijna stil te willen staan (onder de ruis-deadzone),
             # zet target_q op de huidige positie zodat de robot niet langzaam blijft doorkruipen door ruis.
+            # Ignore tiny post-contact movements that would create creep.
             if self.had_contact and raw_dq_norm < self.dq_deadzone:
                 dq_effective = np.zeros(6, dtype=np.float32)
                 self.target_q = q_t.copy()
@@ -701,6 +744,7 @@ class PolicyInferenceNode(Node):
             self.substep_ticks = self.ticks_per_action - 1
 
             q_err = self.target_q - q_t
+            # Closed-loop joint-position tracker outputs bounded velocities.
             q_dot = np.clip(self.kp_track * q_err, -self.max_vel, self.max_vel)
             self.publish_vel(q_dot)
             self.step_count += 1
@@ -721,6 +765,7 @@ class PolicyInferenceNode(Node):
                     f"👉 Druk nu op [s] als de naald RAAK zit (SUCCESS), of op [f] als hij MIS zat (FAILED)!"
                 )
 
+    # Keyboard: space=run/pause, s=success, f=failure, r/h=home, c/o=gripper.
     def process_key(self, key: str):
         if key == ' ':
             if self.mode == 'PAUSED':
@@ -790,6 +835,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True, help="Pad naar getrainde modelmap")
     parser.add_argument('--use-forces', action='store_true', help="Gebruik force-input")
     parser.add_argument('--rate', type=float, default=30.0, help="Control frequentie (Hz)")
+    # max-steps counts policy actions; elapsed time also includes tracking
+    # substeps, inference latency and callback delays (not exactly 8 s).
     parser.add_argument('--max-steps', type=int, default=240, help="Vast aantal stappen per run (240 = ~8s)")
     parser.add_argument('--num-inference-steps', type=int, default=24, help="Aantal DDIM denoising steps")
     parser.add_argument('--speed-scale', type=float, default=1.0, help="Stapgrootte-schaal")

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Records teleoperated UR3e demonstrations into per-episode CSV + JPEG files.
+# This ROS node observes the system; it does not command the robot.
+# Robot/force/camera callbacks cache the most recent sample, while a separate
+# 30 Hz timer bundles those samples (not hardware timestamp synchronization).
 import os
 import csv
 import time
@@ -16,6 +20,7 @@ from geometry_msgs.msg import WrenchStamped
 from std_msgs.msg import String, Float32
 from cv_bridge import CvBridge
 
+# Preserve a fixed joint order regardless of the order in incoming JointState.
 UR3E_JOINT_NAMES = [
     'shoulder_pan_joint',
     'shoulder_lift_joint',
@@ -35,6 +40,8 @@ class DemonstrationRecorder(Node):
         os.makedirs(self.save_dir, exist_ok=True)
         self.episode_idx = self._get_next_episode_idx()
 
+        # Safety/data consistency: reject recording until ALL joints are near
+        # this reference configuration (checked below, 0.06 rad maximum error).
         # Exacte Home-positie ter controle bij de start van elke opname
         home_degrees = [
             -54.65,     # Base
@@ -51,6 +58,9 @@ class DemonstrationRecorder(Node):
         self.latest_img_bgr = None
         self.latest_gripper = 0.0  # 0.0 = helemaal open, 1.0 = helemaal dicht
 
+        # Last 30 raw F/T samples define the tare offset at recording start.
+        # A separate 5-sample rolling mean smooths the forces saved per frame.
+        # Taring at one pose does NOT perform gravity compensation for all poses.
         self.wrench_calib_buffer = deque(maxlen=30)
         self.wrench_filter_buffer = deque(maxlen=5)
         self.force_offset = np.zeros(3, dtype=np.float32)
@@ -59,6 +69,8 @@ class DemonstrationRecorder(Node):
         self.step_count = 0
         self.ram_buffer = []
 
+        # /experiment/command is published by the teleop UI (start/stop/toggle/discard).
+        # The other subscriptions provide the latest robot, sensor and image data.
         self.create_subscription(String, '/experiment/command', self.command_cb, 10)
         self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
         self.create_subscription(
@@ -67,6 +79,8 @@ class DemonstrationRecorder(Node):
         self.create_subscription(Image, '/camera/image_raw', self.image_cb, 10)
         self.create_subscription(Float32, '/gripper/state', self.gripper_cb, 10)
 
+        # Sampling clock for dataset frames. Controller and sensors run at
+        # their own rates; samples are NOT interpolated or precisely aligned.
         self.timer = self.create_timer(1.0 / self.rate_hz, self.timer_cb)
         self.get_logger().info(
             f"Recorder gereed (incl. Gripper logging). Map: {self.save_dir} (Volgende: episode_{self.episode_idx:04d})"
@@ -79,11 +93,13 @@ class DemonstrationRecorder(Node):
         indices = [int(d.split("_")[1]) for d in existing if d.split("_")[1].isdigit()]
         return max(indices) + 1 if indices else 0
 
+    # Callback: reorder measured joint positions into UR3e kinematic order.
     def joint_cb(self, msg: JointState):
         name_to_pos = dict(zip(msg.name, msg.position))
         if all(n in name_to_pos for n in UR3E_JOINT_NAMES):
             self.latest_q = np.array([name_to_pos[n] for n in UR3E_JOINT_NAMES], dtype=np.float32)
 
+    # Cache raw forces for tare; expose an averaged signal for recording.
     def wrench_cb(self, msg: WrenchStamped):
         f = msg.wrench.force
         w = np.array([f.x, f.y, f.z], dtype=np.float32)
@@ -97,6 +113,8 @@ class DemonstrationRecorder(Node):
     def gripper_cb(self, msg: Float32):
         self.latest_gripper = float(msg.data)
 
+    # Recorder commands come from touch_publisher keyboard controls.
+    # "discard" cancels an active trial or deletes the last saved episode.
     def command_cb(self, msg: String):
         cmd = msg.data.strip().lower()
         if cmd == "toggle":
@@ -113,6 +131,8 @@ class DemonstrationRecorder(Node):
         elif cmd == "discard":
             self.discard_episode()
 
+    # Reject missing sensors or a robot that has not returned home.
+    # Take the current no-contact force baseline before collecting frames.
     def start_recording(self):
         missing = []
         if self.latest_q is None:
@@ -126,6 +146,7 @@ class DemonstrationRecorder(Node):
             self.get_logger().warn(f"⚠️ Kan opname NIET starten! Wacht op: {', '.join(missing)}")
             return
 
+        # Home check is per-joint; 0.06 rad is about 3.4 degrees.
         home_err = float(np.max(np.abs(self.latest_q - self.absolute_home_q)))
         if home_err > 0.06:
             self.get_logger().error(
@@ -139,6 +160,7 @@ class DemonstrationRecorder(Node):
         else:
             self.force_offset = self.latest_wrench.copy()
 
+        # Buffer in RAM while running; disk I/O only happens when stopping.
         self.ram_buffer.clear()
         self.step_count = 0
         self.recording = True
@@ -147,6 +169,8 @@ class DemonstrationRecorder(Node):
             f"(Force offset: {np.round(self.force_offset, 2)} N | Gripper: {self.latest_gripper:.2f}) ==="
         )
 
+    # Persist a valid episode as data.csv plus images/frame_XXXXXX.jpg.
+    # The converter uses the CSV image_path field to load each matching image.
     def stop_recording(self):
         self.recording = False
         num_frames = len(self.ram_buffer)
@@ -170,6 +194,7 @@ class DemonstrationRecorder(Node):
                 "gripper", "fx", "fy", "fz", "image_path"
             ])
 
+            # Exactly one image and one CSV row per recorder timer tick.
             for idx, (ts, q_list, g_val, f_list, img_bgr) in enumerate(self.ram_buffer):
                 img_filename = f"frame_{idx:06d}.jpg"
                 img_path = os.path.join(img_dir, img_filename)
@@ -209,6 +234,8 @@ class DemonstrationRecorder(Node):
             f"🗑️  === EPISODE VERWIJDERD: episode_{target_idx:04d} (Volgende is weer {self.episode_idx:04d}) ==="
         )
 
+    # Resample the latest available values at a nominal 30 Hz. A frame
+    # can contain a slightly older camera sample than the corresponding q.
     def timer_cb(self):
         if not self.recording:
             return
@@ -221,6 +248,7 @@ class DemonstrationRecorder(Node):
         if q is None or w is None or img is None:
             return
 
+        # Subtract the at-start tare reference from the filtered F/T reading.
         f_calibrated = w - self.force_offset
         self.ram_buffer.append((
             time.time(),
@@ -236,9 +264,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--use-case', choices=['needle', 'pick_place', 'trajectory'], required=True)
     parser.add_argument('--demo-mode', choices=['haptic', 'no_haptic', 'haptic_wave', 'no_haptic_wave'], required=True)
+    # To use non-default frame rate, conversion --fps must match this value.
     parser.add_argument('--rate', type=float, default=30.0)
     args = parser.parse_args()
 
+    # Output layout is also hard-coded into convert_to_lerobot.py.
+    # If the workspace path changes, update BOTH scripts.
     save_dir = os.path.expanduser(f"~/ros2_ws/raw_demonstrations/{args.use_case}/{args.demo_mode}")
 
     rclpy.init()

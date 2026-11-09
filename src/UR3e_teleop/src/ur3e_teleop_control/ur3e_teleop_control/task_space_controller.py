@@ -45,12 +45,12 @@ class UR3eClosedLoopPoseController(Node):
         # VUL HIER JOUW IDEALE START-HOEKEN IN (LEES AF VAN HET UR TEACH SCHERM)
         # =======================================================================
         home_degrees = [
-            -54.65,     # Base
-            -125.08,    # Shoulder
-            120.29,     # Elbow
-            -109.11,    # Wrist 1
-            -61.30,     # Wrist 2
-            315.64      # Wrist 3
+            -7.47,     # Base
+            -92.91,    # Shoulder
+            88.54,     # Elbow
+            -86.46,    # Wrist 1
+            -90.88,     # Wrist 2
+            0.00      # Wrist 3
         ]
         # De code rekent het nu zelf netjes om naar radialen
         self.absolute_home_q = np.array(home_degrees) * (np.pi / 180.0)
@@ -60,14 +60,14 @@ class UR3eClosedLoopPoseController(Node):
 
         self.dt = 0.02 # Control loop time step (50 Hz)
         
-        self.Kp_lin_max = 10.0
+        self.Kp_lin_max = 12.0
         self.Kp_ang_max = 12.0
         
         self.Kp_lin = 0.0
         self.Kp_ang = 0.0
         
         # PI-controller variables
-        self.Ki_lin = 1.2
+        self.Ki_lin = 0.2
         self.error_lin_integral = np.zeros(3)
 
         self.K_posture = 0.2
@@ -289,7 +289,7 @@ class UR3eClosedLoopPoseController(Node):
         det_J = abs(np.linalg.det(J_6x6))
         
         base_damping = 0.02
-        damping = base_damping + 0.2 * ((0.03 - det_J) / 0.03) if det_J < 0.03 else base_damping
+        damping = base_damping + 0.10 * ((0.03 - det_J) / 0.03) if det_J < 0.03 else base_damping
 
         A = J_6x6 @ J_6x6.T + (damping ** 2) * np.eye(6)
         J_dls = J_6x6.T @ np.linalg.inv(A)
@@ -299,7 +299,7 @@ class UR3eClosedLoopPoseController(Node):
         q_dot = (J_dls @ V_task) + (N @ q_null)
 
         max_speed = np.max(np.abs(q_dot))
-        if max_speed > 3.0: q_dot = q_dot * (3.0 / max_speed)
+        if max_speed > 10.0: q_dot = q_dot * (10.0 / max_speed)
 
         if np.linalg.norm(error_lin) < 0.002 and np.linalg.norm(error_ang) < 0.01:
             q_dot = np.zeros(6)
